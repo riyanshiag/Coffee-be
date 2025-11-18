@@ -1,0 +1,154 @@
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const twilio = require('twilio');
+const db = require('../db');
+require('dotenv').config();
+
+// Initialize Twilio Client
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const serviceSid = process.env.TWILIO_VERIFY_SERVICE_SID;
+
+/**
+ * HELPER: Send OTP via Twilio Verify
+ */
+const sendOtpHelper = async (mobileNumber) => {
+  return await client.verify.v2
+    .services(serviceSid)
+    .verifications.create({ to: mobileNumber, channel: 'sms' });
+};
+
+/**
+ * HELPER: Check OTP via Twilio Verify
+ */
+const verifyOtpHelper = async (mobileNumber, code) => {
+  const verification = await client.verify.v2
+    .services(serviceSid)
+    .verificationChecks.create({ to: mobileNumber, code: code });
+
+  return verification.status === 'approved';
+};
+
+/**
+ * 1. SIGNUP FLOW - INITIATE
+ * Check if user exists, then send OTP
+ */
+exports.initiateSignup = async (req, res) => {
+  const { mobileNumber } = req.body;
+
+  try {
+    // Check if user already exists
+    const userCheck = await db.query('SELECT * FROM Users WHERE mobile_number = $1', [mobileNumber]);
+    if (userCheck.rows.length > 0) {
+      return res.status(409).json({ message: 'User already exists. Please login.' });
+    }
+
+    // Send OTP
+    await sendOtpHelper(mobileNumber);
+    res.status(200).json({ message: 'OTP sent successfully for signup.' });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Error sending OTP', error: error.message });
+  }
+};
+
+/**
+ * 2. SIGNUP FLOW - COMPLETE
+ * Verify OTP -> Hash Password -> Save to DB
+ */
+exports.completeSignup = async (req, res) => {
+  const { mobileNumber, otp, password } = req.body;
+
+  try {
+    // 1. Verify OTP
+    const isOtpValid = await verifyOtpHelper(mobileNumber, otp);
+    if (!isOtpValid) {
+      return res.status(400).json({ message: 'Invalid or expired OTP.' });
+    }
+
+    // 2. Hash Password
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    // 3. Save User
+    await db.query(
+      'INSERT INTO Users (mobile_number, password) VALUES ($1, $2)',
+      [mobileNumber, hashedPassword]
+    );
+
+    res.status(201).json({ message: 'User registered and onboarded successfully.' });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Signup failed', error: error.message });
+  }
+};
+
+/**
+ * 3. LOGIN FLOW - INITIATE
+ * Check if user exists -> Send OTP
+ */
+exports.initiateLogin = async (req, res) => {
+  const { mobileNumber } = req.body;
+
+  try {
+    // Check if user exists
+    const userCheck = await db.query('SELECT * FROM Users WHERE mobile_number = $1', [mobileNumber]);
+    if (userCheck.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found. Please signup.' });
+    }
+
+    // Send OTP (2FA Step 1)
+    await sendOtpHelper(mobileNumber);
+    res.status(200).json({ message: 'OTP sent. Please verify to proceed to password entry.' });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Error initiating login', error: error.message });
+  }
+};
+
+/**
+ * 4. LOGIN FLOW - COMPLETE
+ * Verify OTP -> Verify Password -> Issue JWT
+ */
+exports.completeLogin = async (req, res) => {
+  const { mobileNumber, otp, password } = req.body;
+
+  try {
+    // 1. Verify OTP
+    const isOtpValid = await verifyOtpHelper(mobileNumber, otp);
+    if (!isOtpValid) {
+      return res.status(400).json({ message: 'Invalid or expired OTP.' });
+    }
+
+    // 2. Fetch User
+    const result = await db.query('SELECT * FROM Users WHERE mobile_number = $1', [mobileNumber]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+    const user = result.rows[0];
+
+    // 3. Verify Password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: 'Invalid password.' });
+    }
+
+    // 4. Issue JWT
+    const token = jwt.sign(
+      { mobileNumber: user.mobile_number },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    res.status(200).json({
+      message: 'Login successful.',
+      token: token
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Login failed', error: error.message });
+  }
+};
